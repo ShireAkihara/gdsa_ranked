@@ -13,5 +13,11 @@
     "ghost-opacity": { "type": "float", "name": "Ghost Opacity", "default": 0.5, "min": 0.1, "max": 1.0, "control": { "slider": true } },
     "live-delta": { "type": "bool", "name": "Live Delta Lead", "default": true },
     "streamer-mode": { "type": "bool", "name": "Streamer Mode", "default": false }
+  },
+  "dependencies": {
+    "dankmeme.globed2": {
+      "version": ">=2.1.0",
+      "importance": "suggested"
+    }
   }
 }
