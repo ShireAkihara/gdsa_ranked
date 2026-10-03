@@ -1,6 +1,6 @@
 {
-  "geode": "3.2.0",
-  "gd": { "win": "2.2074", "android": "2.2074", "ios": "2.2074" },
+  "geode": "5.10.1",
+  "gd": { "win": "2.2081", "android": "2.2081", "ios": "2.2081" },
   "version": "v1.0.0",
   "id": "gdsa.ranked",
   "name": "GDSA Ranked",
