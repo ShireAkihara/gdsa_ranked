@@ -7,8 +7,10 @@
 #include <Geode/utils/web.hpp>
 #include <Geode/utils/async.hpp>
 #include <random>
+#include <algorithm>
 #include "Season.hpp"
 #include "Guard.hpp"
+#include <globed/soft-link/API.hpp>
 
 using namespace geode::prelude;
 
@@ -39,7 +41,7 @@ static std::string jsonEscape(std::string const& in) {
 static int getWins()   { return Mod::get()->getSavedValue<int>("wins", 0); }
 static int getLosses() { return Mod::get()->getSavedValue<int>("losses", 0); }
 
-// Pending match (ghost or Globed friend); result is reported by the player afterwards.
+// Pending match (ghost or Globed friend); result is reported afterwards.
 struct PendingMatch { bool active = false; std::string name; int mmr = 0; bool ghost = true; };
 static PendingMatch g_pending;
 static async::TaskHolder<web::WebResponse> g_report;
@@ -57,6 +59,23 @@ static void uploadStats(bool notify) {
             Notification::create(res.ok() ? "Leaderboard updated" : "Leaderboard upload failed",
                 res.ok() ? NotificationIcon::Success : NotificationIcon::Error)->show();
     });
+}
+
+// Apply a match result (shared by the Report button and the automatic ghost result).
+static void applyResult(bool won) {
+    if (!g_pending.active) return;
+    int me = getMMR();
+    int delta = gdsa::mmrDelta(me, g_pending.mmr, won, getStreak());
+    int now = std::max(0, me + delta);
+    Mod::get()->setSavedValue("mmr", now);
+    Mod::get()->setSavedValue("streak", won ? getStreak() + 1 : 0);
+    if (won) Mod::get()->setSavedValue("wins", getWins() + 1);
+    else Mod::get()->setSavedValue("losses", getLosses() + 1);
+    g_pending.active = false;
+    sfx(won ? "gold02.ogg" : "playSound_01.ogg");
+    Notification::create(fmt::format("{}{} MMR (now {})", delta >= 0 ? "+" : "", delta, now),
+        won ? NotificationIcon::Success : NotificationIcon::Warning)->show();
+    uploadStats(false);
 }
 
 // ---------- Overlay (SafePlay / Ghost opacity / Delta / Streamer) ----------
@@ -158,14 +177,12 @@ class RankedPopup : public Popup {
         return true;
     }
 
-    // Step 1: pick opponent type. Ghost = rating-matched practice opponent (offline).
-    // Friend = real person in a Globed room; both players report their own result.
     void onMatch(CCObject*) {
         sfx("playSound_01.ogg");
         auto rep = gdsa::Guard::get().diagnostic(GJAccountManager::get()->m_accountID, getSyncKey());
         if (!rep.passed()) { FLAlertLayer::create("GDSA Guard", "Client failed integrity checks. Matchmaking blocked.", "OK")->show(); return; }
         createQuickPopup("Find Match",
-            "<cy>Ghost</c>: rating-matched opponent (works offline).\n"
+            "<cy>Ghost</c>: rating-matched opponent (works offline). Result is automatic.\n"
             "<cg>Friend</c>: play a friend in a Globed room, then both report.",
             "Ghost", "Friend", [](FLAlertLayer*, bool friendMode) {
                 static std::mt19937 rng{std::random_device{}()};
@@ -178,17 +195,16 @@ class RankedPopup : public Popup {
                     m.mmr = std::max(0, getMMR() + (int)(rng() % 121) - 60);
                 }
                 createQuickPopup("Match Found",
-                    fmt::format("Opponent: <cy>{}</c> ({} MMR)", m.name, m.mmr),
+                    fmt::format("Opponent: <cy>{}</c> ({} MMR)\nOpen any level to start. A match bar appears in-game.", m.name, m.mmr),
                     "Decline", "Accept", [m](FLAlertLayer*, bool accept) {
                         if (!accept) return;
                         g_pending = m; g_pending.active = true;
                         sfx("gold02.ogg");
-                        Notification::create("Match started - press Report when you finish", NotificationIcon::Success)->show();
+                        Notification::create("Match started - open a level", NotificationIcon::Success)->show();
                     });
             });
     }
 
-    // Step 2: report the result, update MMR, upload to shared leaderboard.
     void onReport(CCObject*) {
         if (!g_pending.active) {
             FLAlertLayer::create("Report", "No active match. Press Find Match first.", "OK")->show();
@@ -196,20 +212,7 @@ class RankedPopup : public Popup {
         }
         createQuickPopup("Report Result",
             fmt::format("Opponent: <cy>{}</c> ({} MMR)\nDid you win?", g_pending.name, g_pending.mmr),
-            "I lost", "I won", [](FLAlertLayer*, bool won) {
-                int me = getMMR();
-                int delta = gdsa::mmrDelta(me, g_pending.mmr, won, getStreak());
-                int now = std::max(0, me + delta);
-                Mod::get()->setSavedValue("mmr", now);
-                Mod::get()->setSavedValue("streak", won ? getStreak() + 1 : 0);
-                if (won) Mod::get()->setSavedValue("wins", getWins() + 1);
-                else Mod::get()->setSavedValue("losses", getLosses() + 1);
-                g_pending.active = false;
-                sfx(won ? "gold02.ogg" : "playSound_01.ogg");
-                Notification::create(fmt::format("{}{} MMR (now {})", delta >= 0 ? "+" : "", delta, now),
-                    won ? NotificationIcon::Success : NotificationIcon::Warning)->show();
-                uploadStats(false);
-            });
+            "I lost", "I won", [](FLAlertLayer*, bool won) { applyResult(won); });
     }
 
     void onBoard(CCObject*) {
@@ -270,14 +273,138 @@ class $modify(GDSAMenu, MenuLayer) {
     void onGDSA(CCObject*) { RankedPopup::create()->show(); }
 };
 
+// In-level match HUD: progress bar with "you" and "opponent" markers.
+static constexpr float kBarW = 220.f;
+
 class $modify(GDSAPlay, PlayLayer) {
+    struct Fields {
+        CCLabelBMFont* label = nullptr;
+        CCLayerColor* meDot = nullptr;
+        CCLayerColor* oppDot = nullptr;
+        float elapsed = 0.f;
+        float levelSecs = 60.f;
+        float speed = 1.f;
+        float oppPct = 0.f;
+        bool ghost = false;
+        bool hud = false;
+    };
+
+    void buildHud() {
+        if (!g_pending.active) return;
+        auto f = m_fields.self();
+        f->hud = true;
+        f->ghost = g_pending.ghost;
+        // Rough level length: level units / base speed (ignores speed portals).
+        float len = m_levelLength / 311.58f;
+        f->levelSecs = len > 5.f ? len : 60.f;
+        // Higher-rated ghost runs a bit faster, lower-rated a bit slower.
+        f->speed = std::clamp(1.f + (g_pending.mmr - getMMR()) / 1500.f, 0.85f, 1.15f);
+
+        auto win = CCDirector::get()->getWinSize();
+        auto node = CCNode::create();
+        node->setPosition({win.width / 2, win.height - 28.f});
+        node->setID("gdsa-match-hud"_spr);
+
+        auto bg = CCLayerColor::create({0, 0, 0, 150}, kBarW, 8.f);
+        bg->setPosition({-kBarW / 2, -4.f});
+        node->addChild(bg);
+
+        f->oppDot = CCLayerColor::create({255, 80, 80, 255}, 6.f, 14.f);
+        f->oppDot->setPosition({-kBarW / 2, -7.f});
+        node->addChild(f->oppDot, 2);
+        f->meDot = CCLayerColor::create({90, 255, 120, 255}, 6.f, 14.f);
+        f->meDot->setPosition({-kBarW / 2, -7.f});
+        node->addChild(f->meDot, 3);
+
+        f->label = CCLabelBMFont::create("", "bigFont.fnt");
+        f->label->setScale(0.3f);
+        f->label->setPosition({0, -16.f});
+        node->addChild(f->label);
+
+        m_uiLayer->addChild(node, 50);
+
+        // Friend mode: make sure far-away players keep sending their position.
+        if (!f->ghost && globed::api::available()) globed::api::game::toggleCullingEnabled(false);
+    }
+
+    void updateHud(float dt) {
+        auto f = m_fields.self();
+        if (!f->hud || !g_pending.active) return;
+        f->elapsed += dt;
+        float me = std::clamp(this->getCurrentPercent(), 0.f, 100.f);
+
+        if (f->ghost) {
+            f->oppPct = std::clamp(f->elapsed * f->speed / (f->levelSecs * 1.15f) * 100.f, 0.f, 100.f);
+            f->oppDot->setPositionX(-kBarW / 2 + kBarW * f->oppPct / 100.f - 3.f);
+            float diff = me - f->oppPct;
+            f->label->setString(fmt::format("You {:.0f}%  |  {} {:.0f}%  |  {}{:.0f}%",
+                me, g_pending.name, f->oppPct, diff >= 0 ? "+" : "", diff).c_str());
+        } else {
+            // Friend mode: read the leading Globed player's position from the Globed API.
+            bool found = false;
+            if (globed::api::available() && globed::api::game::isActive() && m_levelLength > 1.f) {
+                float best = -1.f;
+                std::string bestName;
+                for (auto const& rp : globed::api::game::getPlayers()) {
+                    auto* vp = globed::api::player::getFirst(rp.get());
+                    if (!vp) continue;
+                    // VisualPlayer is a node; Globed docs say casting to CCNode* is safe.
+                    auto* node = reinterpret_cast<CCNode*>(vp);
+                    float pct = std::clamp(node->getPositionX() / m_levelLength * 100.f, 0.f, 100.f);
+                    if (pct > best) { best = pct; bestName = globed::api::player::getUsername(rp.get()); }
+                }
+                if (best >= 0.f) {
+                    found = true;
+                    f->oppPct = best;
+                    f->oppDot->setVisible(true);
+                    f->oppDot->setPositionX(-kBarW / 2 + kBarW * best / 100.f - 3.f);
+                    float diff = me - best;
+                    f->label->setString(fmt::format("You {:.0f}%  |  {} {:.0f}%  |  {}{:.0f}%",
+                        me, bestName, best, diff >= 0 ? "+" : "", diff).c_str());
+                }
+            }
+            if (!found) {
+                f->oppDot->setVisible(false);
+                f->label->setString(fmt::format("You {:.0f}%  |  Waiting for Globed players...  |  {:.0f}s",
+                    me, f->elapsed).c_str());
+            }
+        }
+        f->meDot->setPositionX(-kBarW / 2 + kBarW * me / 100.f - 3.f);
+    }
+
     bool init(GJGameLevel* lvl, bool a, bool b) {
         gdsa::Guard::get().resetLevel();
-        return PlayLayer::init(lvl, a, b);
+        if (!PlayLayer::init(lvl, a, b)) return false;
+        buildHud();
+        return true;
+    }
+    void onQuit() {
+        if (m_fields->hud && !m_fields->ghost && globed::api::available())
+            globed::api::game::toggleCullingEnabled(true);
+        PlayLayer::onQuit();
+    }
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        m_fields->elapsed = 0.f;
     }
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
         gdsa::Guard::get().onFrame(dt);
+        updateHud(dt);
+    }
+    void levelComplete() {
+        auto f = m_fields.self();
+        if (f->hud && g_pending.active) {
+            if (f->ghost) {
+                bool won = f->oppPct < 100.f;   // finished before the ghost did
+                Notification::create(won ? "You beat the ghost!" : "Ghost finished first",
+                    won ? NotificationIcon::Success : NotificationIcon::Warning)->show();
+                applyResult(won);
+            } else {
+                Notification::create("Level complete - press Report in GDSA menu", NotificationIcon::Success)->show();
+            }
+        }
+        PlayLayer::levelComplete();
     }
 };
 
