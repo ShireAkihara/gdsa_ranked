@@ -9,7 +9,7 @@ jobs:
         id: build
         with:
           target: Android64
-          sdk: nightly
+          sdk: stable
       - uses: actions/upload-artifact@v4
         with:
           name: gdsa-android64
