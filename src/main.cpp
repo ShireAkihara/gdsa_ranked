@@ -10,7 +10,7 @@
 #include <algorithm>
 #include "Season.hpp"
 #include "Guard.hpp"
-#include <globed/soft-link/API.hpp>
+#include <dankmeme.globed2/include/globed/soft-link/Wrappers.hpp>
 
 using namespace geode::prelude;
 
