@@ -4,6 +4,8 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <vector>
 #include <Geode/utils/file.hpp>
+#include <Geode/utils/web.hpp>
+#include <Geode/utils/async.hpp>
 #include <random>
 #include "Season.hpp"
 #include "Guard.hpp"
@@ -24,7 +26,38 @@ static std::string getSyncKey() {
     }
     return key;
 }
-static std::string serverUrl() { return Mod::get()->getSettingValue<std::string>("server-url"); }
+static std::string serverUrl() {
+    auto u = Mod::get()->getSettingValue<std::string>("server-url");
+    while (!u.empty() && u.back() == '/') u.pop_back();
+    return u;
+}
+static std::string jsonEscape(std::string const& in) {
+    std::string out;
+    for (char c : in) { if (c == '"' || c == '\\') out += '\\'; if ((unsigned char)c >= 32) out += c; }
+    return out;
+}
+static int getWins()   { return Mod::get()->getSavedValue<int>("wins", 0); }
+static int getLosses() { return Mod::get()->getSavedValue<int>("losses", 0); }
+
+// Pending match (ghost or Globed friend); result is reported by the player afterwards.
+struct PendingMatch { bool active = false; std::string name; int mmr = 0; bool ghost = true; };
+static PendingMatch g_pending;
+static async::TaskHolder<web::WebResponse> g_report;
+
+// Upload this player's stats to the shared leaderboard (Cloudflare Worker).
+static void uploadStats(bool notify) {
+    auto* acc = GJAccountManager::get();
+    auto body = fmt::format(
+        "{{\"account_id\":{},\"name\":\"{}\",\"mmr\":{},\"wins\":{},\"losses\":{},\"platform\":\"{}\",\"region\":\"ID\"}}",
+        acc->m_accountID, jsonEscape(std::string(acc->m_username)), getMMR(), getWins(), getLosses(), GEODE_PLATFORM_NAME);
+    auto req = web::WebRequest();
+    req.bodyString(body);
+    g_report.spawn(req.post(serverUrl() + "/report"), [notify](web::WebResponse res) {
+        if (notify || !res.ok())
+            Notification::create(res.ok() ? "Leaderboard updated" : "Leaderboard upload failed",
+                res.ok() ? NotificationIcon::Success : NotificationIcon::Error)->show();
+    });
+}
 
 // ---------- Overlay (SafePlay / Ghost opacity / Delta / Streamer) ----------
 class OverlayPopup : public Popup {
@@ -73,12 +106,11 @@ public:
 };
 
 // ---------- Main Ranked popup ----------
-// NOTE: online features (matchmaking, leaderboard, cloud upload) are stubbed until the
-// server exists and the v5 async web API is wired in.
 class RankedPopup : public Popup {
     CCLabelBMFont* m_season = nullptr;
     CCLabelBMFont* m_timer = nullptr;
     CCLabelBMFont* m_rank = nullptr;
+    async::TaskHolder<web::WebResponse> m_listener;
 
     void refresh() {
         auto s = gdsa::currentSeason();
@@ -114,11 +146,11 @@ class RankedPopup : public Popup {
 
         addRow(-20, "GJ_button_01.png", {
             {"Find Match", menu_selector(RankedPopup::onMatch)},
-            {"Leaderboard", menu_selector(RankedPopup::onBoard)},
-            {"Guard", menu_selector(RankedPopup::onGuard)}});
+            {"Report", menu_selector(RankedPopup::onReport)},
+            {"Leaderboard", menu_selector(RankedPopup::onBoard)}});
         addRow(-65, "GJ_button_04.png", {
+            {"Guard", menu_selector(RankedPopup::onGuard)},
             {"Cloud Sync", menu_selector(RankedPopup::onSync)},
-            {"Export", menu_selector(RankedPopup::onExport)},
             {"Overlay", menu_selector(RankedPopup::onOverlay)}});
 
         refresh();
@@ -126,15 +158,76 @@ class RankedPopup : public Popup {
         return true;
     }
 
+    // Step 1: pick opponent type. Ghost = rating-matched practice opponent (offline).
+    // Friend = real person in a Globed room; both players report their own result.
     void onMatch(CCObject*) {
         sfx("playSound_01.ogg");
         auto rep = gdsa::Guard::get().diagnostic(GJAccountManager::get()->m_accountID, getSyncKey());
         if (!rep.passed()) { FLAlertLayer::create("GDSA Guard", "Client failed integrity checks. Matchmaking blocked.", "OK")->show(); return; }
-        FLAlertLayer::create("Matchmaking", "Guard check passed.\nServer not connected yet.", "OK")->show();
+        createQuickPopup("Find Match",
+            "<cy>Ghost</c>: rating-matched opponent (works offline).\n"
+            "<cg>Friend</c>: play a friend in a Globed room, then both report.",
+            "Ghost", "Friend", [](FLAlertLayer*, bool friendMode) {
+                static std::mt19937 rng{std::random_device{}()};
+                static char const* names[] = {"Ghost Nova", "Ghost Lyra", "Ghost Orion", "Ghost Vega", "Ghost Kairo"};
+                PendingMatch m;
+                m.ghost = !friendMode;
+                if (friendMode) { m.name = "Friend (Globed)"; m.mmr = getMMR(); }
+                else {
+                    m.name = names[rng() % 5];
+                    m.mmr = std::max(0, getMMR() + (int)(rng() % 121) - 60);
+                }
+                createQuickPopup("Match Found",
+                    fmt::format("Opponent: <cy>{}</c> ({} MMR)", m.name, m.mmr),
+                    "Decline", "Accept", [m](FLAlertLayer*, bool accept) {
+                        if (!accept) return;
+                        g_pending = m; g_pending.active = true;
+                        sfx("gold02.ogg");
+                        Notification::create("Match started - press Report when you finish", NotificationIcon::Success)->show();
+                    });
+            });
     }
+
+    // Step 2: report the result, update MMR, upload to shared leaderboard.
+    void onReport(CCObject*) {
+        if (!g_pending.active) {
+            FLAlertLayer::create("Report", "No active match. Press Find Match first.", "OK")->show();
+            return;
+        }
+        createQuickPopup("Report Result",
+            fmt::format("Opponent: <cy>{}</c> ({} MMR)\nDid you win?", g_pending.name, g_pending.mmr),
+            "I lost", "I won", [](FLAlertLayer*, bool won) {
+                int me = getMMR();
+                int delta = gdsa::mmrDelta(me, g_pending.mmr, won, getStreak());
+                int now = std::max(0, me + delta);
+                Mod::get()->setSavedValue("mmr", now);
+                Mod::get()->setSavedValue("streak", won ? getStreak() + 1 : 0);
+                if (won) Mod::get()->setSavedValue("wins", getWins() + 1);
+                else Mod::get()->setSavedValue("losses", getLosses() + 1);
+                g_pending.active = false;
+                sfx(won ? "gold02.ogg" : "playSound_01.ogg");
+                Notification::create(fmt::format("{}{} MMR (now {})", delta >= 0 ? "+" : "", delta, now),
+                    won ? NotificationIcon::Success : NotificationIcon::Warning)->show();
+                uploadStats(false);
+            });
+    }
+
     void onBoard(CCObject*) {
-        FLAlertLayer::create("Leaderboard", "Server not connected yet.", "OK")->show();
+        auto req = web::WebRequest();
+        m_listener.spawn(req.get(serverUrl() + "/leaderboard?region=ID"), [](web::WebResponse res) {
+            if (!res.ok()) { Notification::create("Leaderboard unavailable", NotificationIcon::Error)->show(); return; }
+            auto json = res.json().unwrapOr(matjson::Value());
+            std::string text; int i = 1;
+            for (auto& p : json["players"].asArray().unwrapOr(std::vector<matjson::Value>{})) {
+                text += fmt::format("{}. {} - {} MMR [{}] {}%\n", i++,
+                    p["name"].asString().unwrapOr("?"), p["mmr"].asInt().unwrapOr(0),
+                    p["platform"].asString().unwrapOr("?"), p["winrate"].asInt().unwrapOr(0));
+                if (i > 10) break;
+            }
+            FLAlertLayer::create("Leaderboard (ID)", text.empty() ? "No players yet - play a match and report!" : text, "OK")->show();
+        });
     }
+
     void onGuard(CCObject*) {
         auto r = gdsa::Guard::get().diagnostic(GJAccountManager::get()->m_accountID, getSyncKey());
         FLAlertLayer::create("GDSA Guard Diagnostic",
@@ -144,14 +237,8 @@ class RankedPopup : public Popup {
             "OK")->show();
     }
     void onSync(CCObject*) {
-        FLAlertLayer::create("Cloud Sync Key", fmt::format("Your recovery key:\n<cy>{}</c>\n\nUpload needs the server.", getSyncKey()), "OK")->show();
-    }
-    void onExport(CCObject*) {
-        auto path = Mod::get()->getSaveDir() / "gdsa.geode.json";
-        auto j = fmt::format("{{\"key\":\"{}\",\"mmr\":{},\"streak\":{}}}", getSyncKey(), getMMR(), getStreak());
-        auto r = utils::file::writeString(path, j);
-        Notification::create(r.isOk() ? "Exported to save dir" : "Export failed",
-            r.isOk() ? NotificationIcon::Success : NotificationIcon::Error)->show();
+        uploadStats(true);
+        FLAlertLayer::create("Cloud Sync Key", fmt::format("Your key:\n<cy>{}</c>", getSyncKey()), "OK")->show();
     }
     void onOverlay(CCObject*) { OverlayPopup::create()->show(); }
 
