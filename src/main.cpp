@@ -192,8 +192,8 @@ class $modify(GDSAPlay, PlayLayer) {
 };
 
 class $modify(GDSAInput, GJBaseGameLayer) {
-    void pushButton(PlayerButton btn, bool p1) {
-        GJBaseGameLayer::pushButton(btn, p1);
-        gdsa::Guard::get().onClick();
+    void handleButton(bool down, int button, bool isPlayer1) {
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        if (down) gdsa::Guard::get().onClick();
     }
 };
