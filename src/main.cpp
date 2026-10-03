@@ -218,11 +218,14 @@ class RankedPopup : public Popup {
             if (!res.ok()) { Notification::create("Leaderboard unavailable", NotificationIcon::Error)->show(); return; }
             auto json = res.json().unwrapOr(matjson::Value());
             std::string text; int i = 1;
-            for (auto& p : json["players"].asArray().unwrapOr(std::vector<matjson::Value>{})) {
-                text += fmt::format("{}. {} - {} MMR [{}] {}%\n", i++,
-                    p["name"].asString().unwrapOr("?"), p["mmr"].asInt().unwrapOr(0),
-                    p["platform"].asString().unwrapOr("?"), p["winrate"].asInt().unwrapOr(0));
-                if (i > 10) break;
+            auto arr = json["players"].asArray();
+            if (arr.isOk()) {
+                for (auto& p : arr.unwrap()) {
+                    text += fmt::format("{}. {} - {} MMR [{}] {}%\n", i++,
+                        p["name"].asString().unwrapOr("?"), p["mmr"].asInt().unwrapOr(0),
+                        p["platform"].asString().unwrapOr("?"), p["winrate"].asInt().unwrapOr(0));
+                    if (i > 10) break;
+                }
             }
             FLAlertLayer::create("Leaderboard (ID)", text.empty() ? "No players yet - play a match and report!" : text, "OK")->show();
         });
